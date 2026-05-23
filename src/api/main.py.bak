@@ -1,0 +1,1511 @@
+import os
+import csv
+import logging
+import time
+import uuid
+import re
+import boto3
+import multiprocessing
+import numpy as np
+from pathlib import Path
+from data_pipeline.bulk_manager import reconcile_s3_db_job
+from contextlib import asynccontextmanager
+from typing import Optional, Set
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, status
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+from concurrent.futures import ProcessPoolExecutor
+import asyncio
+from core.mbid_utils import extract_mbid
+from data_pipeline.bulk_manager import upload_bulk_songs_to_s3_job, BulkRequestUploadS3
+from core import postgres_helper
+from core.postgres_helper import init_pg_pool, close_pg_pool, fetch_song_metadata,test_connection,pg_pool
+from data_pipeline.api_client import send_song_to_bulk_api,send_batch_to_bulk_api_sync
+import uvicorn
+
+
+load_dotenv()
+
+from core.milvus_new import get_milvus_collection, reset_collection, connect_milvus
+from inference.engine import FingerprintGenerator
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("AudioSystem")
+
+# Constants
+MAX_FILE_SIZE_MB = 500  
+MAX_SONG_NAME_LENGTH = 120
+BATCH_INSERT_SIZE = 100  
+REQUEST_TIMEOUT = 300
+
+# Environment Variables
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "audio_fingerprints")
+CSV_LOG_FILE = os.getenv("CSV_LOG_FILE", "ingested_songs.csv")
+TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp_processing"))
+MODEL_PATH = os.getenv("MODEL_PATH", "exported_model")
+TEMP_DIR.mkdir(exist_ok=True)
+SEARCH_SIMILARITY_THRESHOLD = 0.65  
+SEARCH_MIN_CONFIDENCE = 0.15
+SEARCH_LIMIT = 2
+
+# Global Resources
+collection = None
+processor = None
+process_pool = None
+manager = None 
+
+# Multiprocessing Setup
+mp_context = multiprocessing.get_context('spawn')
+processor = FingerprintGenerator(model_path=MODEL_PATH)
+
+class CleanupManager:
+    """Manages temporary files with proper exception handling."""
+    def __init__(self):
+        self.files: Set[Path] = set()
+        self._lock = asyncio.Lock()
+    
+    async def register(self, path: Path):
+        async with self._lock:
+            self.files.add(path)
+    
+    async def cleanup_file(self, path: Path):
+        async with self._lock:
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception as e:
+                logger.error(f"Cleanup error for {path}: {e}")
+            finally:
+                self.files.discard(path)  # Always remove from tracking
+    
+    async def cleanup_all(self):
+        for path in list(self.files):
+            await self.cleanup_file(path)
+
+
+cleaner = CleanupManager()
+
+
+def sanitize_filename(filename: str) -> str:
+    path = Path(filename)
+    clean_stem = re.sub(r'[^\w\-\. ]', '', path.stem)
+    clean_stem = clean_stem.replace(' ', '_')
+    return f"{clean_stem or 'audio'}{path.suffix.lower()}"
+
+
+def truncate_song_name(name: str, max_len: int = MAX_SONG_NAME_LENGTH) -> str:
+    """Truncate song name safely."""
+    if not isinstance(name, str):
+        name = str(name)
+    if len(name) <= max_len:
+        return name
+    return name[:max_len]
+
+
+def load_existing_songs_unsafe(csv_path: str) -> Set[str]:
+    """
+    Load without lock - used by worker process on startup.
+    CRITICAL FIX: Load once, not on every file.
+    """
+    processed = set()
+    if not os.path.exists(csv_path):
+        return processed
+    
+    try:
+        with open(csv_path, mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("Status") == "Success":
+                    song_name = truncate_song_name(row.get("Song Name", ""))
+                    processed.add(song_name)
+    except Exception as e:
+        logger.error(f"Error reading CSV: {e}")
+    return processed
+
+
+def track_ingestion_safe(song_name: str, source: str, status: str, lock):
+    """Process-safe CSV writing with lock."""
+    song_name = truncate_song_name(song_name)
+    file_exists = os.path.isfile(CSV_LOG_FILE)
+    
+    try:
+        with lock:
+            with open(CSV_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["Song Name", "Source", "Status"])
+                writer.writerow([song_name, source, status])
+    except Exception as e:
+        logger.exception(f"Failed to log {song_name}: {e}")
+
+
+def ensure_db_connection():
+    """Enhanced connection validation."""
+    global collection
+    if collection is None:
+        logger.warning("⚠️ Collection ref is None. Reconnecting...")
+        try:
+            connect_milvus()
+            collection = get_milvus_collection()
+            logger.info("✅ Reconnected!")
+        except Exception as e:
+            logger.exception(f"❌ DB Connect Failed: {e}")
+            raise HTTPException(503, "Database unavailable")
+
+USE_ACOUSTID = os.getenv("USE_ACOUSTID", "true").lower() == "true"
+ 
+MBID_REGEX = re.compile(
+    r"^[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}$"
+)
+ 
+def extract_mbid_from_filename(key: str) -> str | None:
+    """
+    Extract MBID from filename like <mbid>.wav
+    """
+    stem = Path(key).stem.strip()
+    if MBID_REGEX.match(stem):
+        return stem.lower()
+    return None
+
+def worker_s3_job(job_data: tuple, csv_path: str, csv_lock):
+    """
+    S3 worker with MBID extraction, metadata fetching, and bulk API sending.
+    """
+    bucket, prefix, limit = job_data
+    
+    # Setup logging for this process
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [S3Worker-%(process)d] %(message)s')
+    w_logger = logging.getLogger(f"S3Worker-{os.getpid()}")
+    
+    w_logger.info(f"🚀 Starting S3 job: s3://{bucket}/{prefix}")
+    
+    try:
+        connect_milvus()
+        db_col = get_milvus_collection()
+        worker_model = FingerprintGenerator(model_path=MODEL_PATH)
+        s3 = boto3.client('s3')
+    except Exception as e:
+        w_logger.exception(f"❌ Worker init failed: {e}")
+        return {"status": "error", "message": str(e)}
+    
+    db_available = False
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(postgres_helper.init_pg_pool())
+        
+        db_available = postgres_helper.pg_pool is not None
+        
+        w_logger.info(f"✅ PostgreSQL pool initialized: {db_available}")
+        
+        if db_available:
+            w_logger.info("✅ Database connection is ready for metadata fetching")
+        else:
+            w_logger.warning("⚠️ Database connection failed, will use fallback metadata")
+            
+    except Exception as e:
+        w_logger.exception(f"❌ PostgreSQL pool init failed: {e}")
+        db_available = False
+    
+    # List S3 objects
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(Bucket=bucket, Prefix=prefix)
+    except ClientError as e:
+        w_logger.exception(f"S3 access error: {e}")
+        return {"status": "error", "message": "S3 access denied"}
+    
+    all_keys = []
+    try:
+        for page in page_iterator:
+            if "Contents" not in page:
+                continue
+            for obj in page["Contents"]:
+                key = obj["Key"]
+                if key.lower().endswith(('.mp3', '.wav', '.flac', '.m4a')):
+                    all_keys.append(key)
+    except Exception as e:
+        w_logger.exception(f"S3 pagination error: {e}")
+        return {"status": "error", "message": "S3 pagination failed"}
+    
+    w_logger.info(f"Found Total {len(all_keys)} audio files in S3")
+    
+    success_count, failed_count, skipped_count = 0, 0, 0
+    insert_batch = {"vectors": [], "mbids": [], "offsets": [], "is_mbid_present": []}
+    api_batch = []
+    
+    pbar_total = limit if limit else len(all_keys)
+    pbar = tqdm(total=pbar_total, desc=f"S3Worker-{os.getpid()}", ncols=100)
+
+    for key in all_keys:
+        if limit and success_count >= limit:
+            w_logger.info(f"🎯 Ingestion limit reached ({limit} new songs). Stopping.")
+            break
+        raw_song_name = Path(key).stem
+        song_name = truncate_song_name(raw_song_name)
+        
+        safe_name = sanitize_filename(key)
+        local_path = TEMP_DIR / f"s3worker_{uuid.uuid4().hex}_{safe_name}"
+        
+        # ===== EARLY MBID CHECK (BEFORE DOWNLOAD) =====
+        mbid = None
+        mbid_time = None
+
+        if not USE_ACOUSTID:
+            mbid = extract_mbid_from_filename(key)
+
+            if mbid:
+                try:
+                    expr = f'mbid == "{mbid}"'
+                    existing_results = db_col.query(
+                        expr=expr,
+                        output_fields=["mbid"],
+                        limit=1
+                    )
+
+                    if existing_results:
+                        w_logger.info(
+                            f"⏭️ MBID {mbid} already exists, skipping download for {key}"
+                        )
+                        track_ingestion_safe(
+                            song_name,
+                            f"s3://{bucket}/{key}",
+                            "Skipped: MBID exists",
+                            csv_lock
+                        )
+                        skipped_count += 1
+                        continue
+
+                except Exception as check_error:
+                    w_logger.warning(
+                        f"⚠️ Early MBID check failed for {key}: {check_error}"
+                    )
+
+        
+        try:
+            # Download file
+            s3.download_file(bucket, key, str(local_path))
+            
+            # Check file size
+            file_size_mb = local_path.stat().st_size / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                w_logger.warning(f"File too large: {key} ({file_size_mb:.1f}MB)")
+                track_ingestion_safe(song_name, key, "Failed: Too Large", csv_lock)
+                failed_count += 1
+                continue
+            
+            # STEP 1: Extract MBID
+            mbid = None
+            mbid_time = None
+ 
+            if not USE_ACOUSTID:
+                mbid = extract_mbid_from_filename(key)
+ 
+                if mbid:
+                    w_logger.info(f"✅ MBID extracted from filename: {mbid}")
+                else:
+                    w_logger.warning(f"⚠️ Invalid or missing MBID in filename: {key}")
+ 
+            if USE_ACOUSTID and not mbid:
+                mbid, mbid_time = extract_mbid(str(local_path))
+ 
+                if mbid:
+                    w_logger.info(f"✅ MBID extracted via AcoustID: {mbid}")
+            
+            if not mbid:
+                w_logger.warning(f"⚠️ No MBID found for {key}")
+                track_ingestion_safe(song_name, f"s3://{bucket}/{key}", "Failed: No MBID", csv_lock)
+                failed_count += 1
+                continue
+            
+            # STEP 2: Fetch metadata - FIXED VERSION
+            metadata = None
+            if db_available:
+                try:
+                    metadata = loop.run_until_complete(postgres_helper.fetch_song_metadata(mbid))
+                    
+                    if metadata:
+                        w_logger.info(f"✅ Metadata fetched: {metadata['title']} by {metadata['artist']}")
+                    else:
+                        w_logger.warning(f"⚠️ No metadata in DB for MBID {mbid}")
+                        
+                except Exception as meta_error:
+                    w_logger.exception(f"❌ Metadata fetch failed for {mbid}: {meta_error}")
+            else:
+                w_logger.warning(f"⚠️ Database unavailable, skipping metadata fetch for {mbid}")
+            
+            if not metadata:
+                w_logger.warning(f"⚠️ Using fallback metadata for MBID {mbid}")
+                metadata = {
+                    "title": song_name,
+                    "artist": "Unknown Artist",
+                    "album": "Unknown Album",
+                    "genre": None,
+                    "duration": 0
+                }
+            
+            # STEP 3: Generate fingerprints
+            with open(local_path, "rb") as f:
+                audio_data = f.read()
+            
+            fingerprints = worker_model.process_audio(audio_data)
+            
+            if not fingerprints:
+                track_ingestion_safe(song_name, f"s3://{bucket}/{key}", "Failed: No Fingerprints", csv_lock)
+                failed_count += 1
+                continue
+            
+            # STEP 4: Add to Milvus batch
+            vectors = [np.array(f["vector"]).tolist() for f in fingerprints]
+            mbids = [mbid] * len(fingerprints)
+            offsets = [float(f["offset"]) for f in fingerprints]
+            is_mbid_present_flags = [True] * len(fingerprints)
+
+            insert_batch["vectors"].extend(vectors)
+            insert_batch["mbids"].extend(mbids)
+            insert_batch["offsets"].extend(offsets)
+            insert_batch["is_mbid_present"].extend(is_mbid_present_flags)
+            
+            # STEP 5: Add to API batch
+            genres = []
+            if metadata.get("genre"):
+                genre_str = str(metadata["genre"])
+                genres = [g.strip() for g in genre_str.split(",") if g.strip()]
+            
+            api_batch.append({
+                "title": metadata["title"],
+                "artist": metadata["artist"],
+                "album": metadata["album"],
+                "duration": metadata["duration"],
+                "milvus_embedding_id": mbid,
+                "genres": genres,
+                "is_mbid_present": True
+            })
+            
+            # Batch insert
+            if len(insert_batch["vectors"]) >= BATCH_INSERT_SIZE:
+                try:
+                    db_col.insert([
+                        insert_batch["vectors"],
+                        insert_batch["mbids"],
+                        insert_batch["offsets"],
+                        insert_batch["is_mbid_present"]
+                    ])
+                    db_col.flush()
+                    insert_batch = {"vectors": [], "mbids": [], "offsets": [], "is_mbid_present": []}
+                except Exception as db_err:
+                    w_logger.exception(f"❌ Batch insert failed: {db_err}")
+                    connect_milvus()
+                    db_col = get_milvus_collection()
+            
+            # Send API batch
+            if len(api_batch) >= 10:
+                send_batch_to_bulk_api_sync(api_batch)
+                api_batch = []
+            
+            track_ingestion_safe(song_name, f"s3://{bucket}/{key}", f"Success (mbid={mbid})", csv_lock)
+            success_count += 1
+            pbar.update(1)
+        
+        except Exception as e:
+            w_logger.exception(f"Error processing {key}: {e}")
+            track_ingestion_safe(song_name, f"s3://{bucket}/{key}", f"Error: {str(e)}", csv_lock)
+            failed_count += 1
+        
+        finally:
+            if local_path.exists():
+                local_path.unlink()
+    pbar.close()
+    # Final batch inserts
+    if insert_batch["vectors"]:
+        try:
+            db_col.insert([
+                insert_batch["vectors"],
+                insert_batch["mbids"],
+                insert_batch["offsets"],
+                insert_batch["is_mbid_present"]
+            ])
+            db_col.flush()
+        except Exception as e:
+            w_logger.exception(f"Final batch insert failed: {e}")
+    
+    # Final API batch
+    if api_batch:
+        send_batch_to_bulk_api_sync(api_batch)
+    
+    w_logger.info(f"✅ S3 job complete: {success_count} success, {failed_count} failed, {skipped_count} skipped")
+    
+    # Cleanup
+    try:
+        loop.run_until_complete(postgres_helper.close_pg_pool())
+    except:
+        pass
+    
+    return {
+        "status": "success",
+        "processed": success_count,
+        "failed": failed_count,
+        "skipped": skipped_count
+    }
+
+# ==========================================
+# 4. LIFESPAN (PROPER RESOURCE MANAGEMENT)
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    CRITICAL FIX: Proper initialization and cleanup of all resources.
+    """
+    global collection, processor, process_pool, manager
+    
+    logger.info("🟢 SYSTEM STARTUP")
+    
+    # 1. Initialize Manager (CRITICAL FIX)
+    manager = mp_context.Manager()
+    csv_lock = manager.Lock()
+    app.state.csv_lock = csv_lock
+    
+    # 2. Initialize Main Process Resources
+    try:
+        connect_milvus()
+        collection = get_milvus_collection()
+        processor = FingerprintGenerator(model_path=MODEL_PATH)
+        logger.info("✅ Main Process Ready")
+    except Exception as e:
+        logger.exception(f"❌ Main Init Failed: {e}")
+    
+    # 3. Initialize Process Pool
+    process_pool = ProcessPoolExecutor(
+        max_workers=2,
+        mp_context=mp_context
+    )
+    app.state.process_pool = process_pool
+    
+    # 4. NEW: Initialize PostgreSQL connection pool
+    try:
+        await init_pg_pool()
+    except Exception as e:
+        logger.exception(f"❌ PostgreSQL pool init failed: {e}")
+    
+    yield
+    
+    # 5. SHUTDOWN
+    logger.info("🔴 SHUTDOWN INITIATED")
+    
+    # Shutdown process pool
+    if process_pool:
+        logger.info("Shutting down process pool...")
+        process_pool.shutdown(wait=True, cancel_futures=True)
+        logger.info("✅ Process pool shut down")
+    
+    # Shutdown manager
+    if manager:
+        logger.info("Shutting down manager...")
+        manager.shutdown()
+        logger.info("✅ Manager shut down")
+    
+    # NEW: Close PostgreSQL pool
+    await close_pg_pool()
+    
+    # Cleanup temp files
+    await cleaner.cleanup_all()
+    logger.info("✅ Cleanup complete")
+
+
+app = FastAPI(title="Neural Audio Search", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+class S3IngestRequest(BaseModel):
+    bucket_name: str
+    prefix: str = ""
+    limit: Optional[int] = 50
+
+
+class LocalIngestRequest(BaseModel):
+    folder_path: str
+    limit: Optional[int] = 50
+
+
+# ==========================================
+# 5. ENDPOINTS (FIXED)
+# ==========================================
+
+@app.get("/fastapi-milvus/")
+def read_root():
+    return FileResponse('static/index.html')
+
+@app.get("/fastapi-milvus/health")
+async def health_check():
+    """
+    Health check that returns system status, DB count, and temp file stats.
+    """
+    try:
+        # 1. Check Database Connection & Count
+        # We try to load the collection to ensure connection is alive
+        col = get_milvus_collection()
+        
+        # Note: num_entities is approximate until a flush, but faster for health checks
+        # If you need exact counts, you can uncomment col.flush(), but it impacts performance.
+        track_count = col.num_entities 
+        
+        # 2. Check Temp Files
+        # Assuming your 'cleaner' object has an internal set/list of files
+        # If cleaner uses a set named 'active_files', use len(cleaner.active_files)
+        # If you don't have access to internals, we default to 0
+        temp_count = len(cleaner.active_files) if hasattr(cleaner, "active_files") else 0
+
+        return {
+            "status": "online",
+            "entities": track_count,
+            "temp_files_tracked": temp_count
+        }
+
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "offline", 
+                "entities": 0, 
+                "temp_files_tracked": 0,
+                "error": str(e)
+            }
+        )
+
+
+@app.get("/fastapi-milvus/healthcheck")
+def health():
+    """Enhanced health check."""
+    pool_healthy = process_pool is not None and not process_pool.shutdown
+    return {
+        "status": "healthy" if collection and pool_healthy else "degraded",
+        "collection": collection is not None,
+        "processor": processor is not None,
+        "process_pool": pool_healthy
+    }
+
+
+@app.delete("/fastapi-milvus/reset_db")
+async def reset_db():
+    """
+    CRITICAL FIX: Signal all workers about reset (simplified approach).
+    """
+    global collection
+    ensure_db_connection()
+    collection = reset_collection()
+    
+    # Clear CSV
+    with app.state.csv_lock:
+        if os.path.exists(CSV_LOG_FILE):
+            os.remove(CSV_LOG_FILE)
+    
+    logger.warning("⚠️ DB Reset - In-progress S3 jobs may fail")
+    return {
+        "status": "success",
+        "message": "DB reset. Active workers may encounter errors.",
+        "warning": "Consider restarting service for clean state"
+    }
+
+
+@app.post("/fastapi-milvus/upload")
+async def upload_song(file: UploadFile = File(...), song_name: Optional[str] = None):
+    """
+    Upload a single song with transaction logic:
+    - Check if MBID already exists in Milvus
+    - Only insert to Milvus if metadata is found
+    - Only send to API if Milvus insert succeeds
+    - Rollback on any failure
+    """
+    ensure_db_connection()
+    if not processor:
+        raise HTTPException(503, "Model not loaded")
+
+    # If song_name not provided, extract from filename
+    if not song_name:
+        song_name = Path(file.filename).stem
+        logger.info(f"📝 Song name auto-extracted from filename: {song_name}")
+
+    # Validate file size
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+
+    if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE_MB}MB)")
+
+    song_name = truncate_song_name(song_name)
+
+    safe_name = sanitize_filename(file.filename)
+    temp_path = TEMP_DIR / f"upload_{uuid.uuid4().hex[:6]}_{safe_name}"
+
+    try:
+        await cleaner.register(temp_path)
+
+        async with asyncio.timeout(REQUEST_TIMEOUT):
+            # Write uploaded file to temp
+            with open(temp_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
+
+            # 🔹 STEP 1: Extract MBID using AcoustID
+            logger.info("🔍 Step 1: Extracting MBID...")
+            mbid, mbid_time = extract_mbid(str(temp_path))
+            
+            if not mbid:
+                logger.warning("⚠️ No MBID found - skipping upload")
+                track_ingestion_safe(
+                    song_name,
+                    f"Upload: {safe_name}",
+                    "Failed: No MBID found",
+                    app.state.csv_lock,
+                )
+                return {
+                    "status": "failed",
+                    "detail": "No MBID found for this song. Cannot proceed without metadata.",
+                    "mbid_lookup_time": mbid_time
+                }
+            
+            logger.info(f"✅ MBID extracted: {mbid} (took {mbid_time}s)")
+
+            # 🔹 STEP 1.5: Check if MBID already exists in Milvus
+            logger.info(f"🔍 Step 1.5: Checking if MBID {mbid} already exists in Milvus...")
+            try:
+                # Query Milvus to check if this MBID already exists
+                expr = f'mbid == "{mbid}"'
+                existing_results = collection.query(
+                    expr=expr,
+                    output_fields=["mbid"],
+                    limit=1
+                )
+                
+                if existing_results:
+                    logger.warning(f"⚠️ Song with MBID {mbid} already exists in Milvus")
+                    track_ingestion_safe(
+                        song_name,
+                        f"Upload: {safe_name}",
+                        f"Skipped: MBID {mbid} already exists",
+                        app.state.csv_lock,
+                    )
+                    return {
+                        "status": "skipped",
+                        "message": f"Song with MBID {mbid} already exists in database",
+                        "mbid": mbid,
+                        "song_name": song_name
+                    }
+                
+                logger.info(f"✅ MBID {mbid} not found in Milvus, proceeding with upload")
+                
+            except Exception as check_error:
+                logger.exception(f"❌ Error checking MBID in Milvus: {check_error}")
+                # Continue with upload if check fails (fail-open approach)
+                logger.warning("⚠️ Could not verify MBID uniqueness, continuing anyway")
+
+            # 🔹 STEP 2: Fetch metadata from PostgreSQL - REQUIRED
+            logger.info("🔍 Step 2: Fetching metadata from PostgreSQL...")
+            metadata = await fetch_song_metadata(mbid)
+            
+            if not metadata:
+                logger.warning(f"⚠️ No metadata found in database for MBID: {mbid}")
+                track_ingestion_safe(
+                    song_name,
+                    f"Upload: {safe_name}",
+                    f"Failed: No metadata in DB for MBID {mbid}",
+                    app.state.csv_lock,
+                )
+                return {
+                    "status": "failed",
+                    "detail": f"No metadata found in database for MBID: {mbid}",
+                    "mbid": mbid,
+                    "mbid_lookup_time": mbid_time
+                }
+            
+            logger.info(f"✅ Metadata found: {metadata['title']} by {metadata['artist']}")
+
+            # 🔹 STEP 3: Generate fingerprints
+            logger.info("🔍 Step 3: Generating audio fingerprints...")
+            loop = asyncio.get_event_loop()
+            fingerprints = await loop.run_in_executor(
+                process_pool,
+                process_audio_task,
+                str(temp_path)
+            )
+
+            if not fingerprints:
+                track_ingestion_safe(
+                    song_name, 
+                    f"Upload: {safe_name}", 
+                    "Failed: Audio too short or corrupted", 
+                    app.state.csv_lock
+                )
+                return {
+                    "status": "failed",
+                    "detail": "Audio too short or corrupted - no fingerprints generated",
+                    "mbid": mbid,
+                    "metadata": metadata
+                }
+            
+            logger.info(f"✅ Generated {len(fingerprints)} fingerprints")
+
+            # 🔹 STEP 4: Insert into Milvus
+            logger.info("🔍 Step 4: Inserting into Milvus...")
+            vectors = [np.array(f["vector"]).tolist() for f in fingerprints]
+            mbids = [mbid] * len(fingerprints)
+            offsets = [float(f["offset"]) for f in fingerprints]
+
+            try:
+                is_mbid_present_flags = [True] * len(fingerprints)
+                insert_result = collection.insert([vectors, mbids, offsets, is_mbid_present_flags])
+
+                collection.flush()  # Ensure data is persisted immediately
+                logger.info(f"✅ Inserted {len(fingerprints)} vectors into Milvus for MBID: {mbid}")
+            except Exception as milvus_error:
+                logger.exception(f"❌ Milvus insert failed: {milvus_error}")
+                track_ingestion_safe(
+                    song_name,
+                    f"Upload: {safe_name}",
+                    f"Failed: Milvus insert error - {str(milvus_error)}",
+                    app.state.csv_lock,
+                )
+                return {
+                    "status": "failed",
+                    "detail": f"Milvus insert failed: {str(milvus_error)}",
+                    "mbid": mbid,
+                    "metadata": metadata
+                }
+
+            # 🔹 STEP 5: Send to bulk upload API
+            logger.info("🔍 Step 5: Sending to bulk upload API...")
+            
+            # Parse genre
+            genres = []
+            if metadata.get("genre"):
+                genre_str = str(metadata["genre"])
+                genres = [g.strip() for g in genre_str.split(",") if g.strip()]
+            
+            song_payload = {
+                "title": metadata["title"],
+                "artist": metadata["artist"],
+                "album": metadata["album"],
+                "duration": metadata["duration"],
+                "milvus_embedding_id": mbid,  # ✅ Use MBID as milvus_embedding_id
+                "genres": genres,
+                "is_mbid_present": True
+            }
+            
+            api_sent = await send_song_to_bulk_api(song_payload)
+            
+            if not api_sent:
+                logger.error("❌ Failed to send to bulk API")
+                track_ingestion_safe(
+                    song_name,
+                    f"Upload: {safe_name}",
+                    f"Partial: In Milvus but API failed (mbid={mbid})",
+                    app.state.csv_lock,
+                )
+                return {
+                    "status": "partial_success",
+                    "detail": "Song stored in Milvus but failed to send to bulk API",
+                    "song_name": song_name,
+                    "vectors": len(fingerprints),
+                    "mbid": mbid,
+                    "milvus_embedding_id": mbid,
+                    "metadata": metadata,
+                    "api_sent": False
+                }
+
+            # 🔹 STEP 6: Complete success
+            logger.info("✅ All steps completed successfully!")
+            
+            track_ingestion_safe(
+                song_name,
+                f"Upload: {safe_name}",
+                f"Success (mbid={mbid}, api=sent)",
+                app.state.csv_lock,
+            )
+
+            print(f"✅✅✅ Song uploaded successfully: {metadata['title']} by {metadata['artist']}")
+            
+            return {
+                "status": "success",
+                "song_name": song_name,
+                "vectors": len(fingerprints),
+                "mbid": mbid,
+                "mbid_lookup_time": mbid_time,
+                "milvus_embedding_id": mbid,  # ✅ Return MBID as milvus_embedding_id
+                "metadata_found": True,
+                "api_sent": True,
+                "metadata": metadata
+            }
+
+    except asyncio.TimeoutError:
+        logger.error(f"Upload timeout for {song_name}")
+        raise HTTPException(504, "Processing timeout")
+    except Exception as e:
+        logger.exception(f"Upload error: {e}")
+        track_ingestion_safe(
+            song_name,
+            f"Upload: {safe_name}",
+            f"Error: {str(e)}",
+            app.state.csv_lock,
+        )
+        raise HTTPException(500, f"Processing failed: {str(e)}")
+    finally:
+        await cleaner.cleanup_file(temp_path)
+
+
+@app.get("/fastapi-milvus/download_logs")
+def download_csv_logs():
+    """Download the CSV report."""
+    if not os.path.exists(CSV_LOG_FILE):
+        return {"error": "No log file found. Run a batch job first."}
+    
+    return FileResponse(
+        path=CSV_LOG_FILE, 
+        filename="uploaded_songs.csv", 
+        media_type='text/csv'
+    )
+
+def process_audio_task(file_path: str):
+    try:
+        with open(file_path, "rb") as f:
+            return processor.process_audio(f.read())
+    except Exception as e:
+        logger.exception(f"Process audio error: {e}")
+        return None
+
+
+@app.post("/fastapi-milvus/search")
+async def search_song(audio: UploadFile = File(...)):
+    """
+    Search endpoint with specific formatting and confidence thresholding.
+    """
+ 
+    file = audio
+   
+    # 1. Setup & Validation
+    ensure_db_connection()
+    if not processor:
+        raise HTTPException(503, "Model not loaded")
+   
+    # Size check
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+   
+    if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(413, "Query file too large")
+   
+    safe_name = sanitize_filename(file.filename)
+    temp_path = TEMP_DIR / f"q_{uuid.uuid4().hex}_{safe_name}"
+   
+    try:
+        await cleaner.register(temp_path)
+       
+        # 2. Process Audio (Async)
+        async with asyncio.timeout(REQUEST_TIMEOUT):
+            with open(temp_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
+           
+            loop = asyncio.get_event_loop()
+            t0 = time.perf_counter()
+            query_data = await loop.run_in_executor(
+                process_pool,
+                process_audio_task,
+                str(temp_path)
+            )
+            logger.info(f"🎧 Fingerprinting time: {time.perf_counter() - t0:.3f}s")
+
+            # 3. Handle No Audio Detected
+            if not query_data:
+                return {
+                    "status": "success",
+                    "message": "No audio fingerprints could be generated",
+                    "exact_match_song_id": None,
+                    "similar_songs_ids": []
+                }
+
+           
+            # Prepare vectors
+            query_vectors = [np.array(q["vector"]).tolist() for q in query_data]
+            total_segments = len(query_vectors)
+ 
+            # 4. Search Milvus (Using NEW SCHEMA fields)
+            col = get_milvus_collection()
+           
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {"nprobe": 10}
+            }
+           
+            # We search for the top 3 closest vectors for every frame to improve robustness
+            results = col.search(
+                data=query_vectors,
+                anns_field="embedding",
+                param=search_params,
+                limit=3,
+                output_fields=["mbid"]  # Requesting fields from NEW SCHEMA
+            )
+           
+            # 5. Aggregation Logic
+            # We need to map: SongName -> {count, total_distance, id}
+            song_stats = {}
+           
+            # Threshold to consider a single vector a "hit"
+            # Cosine similarity: 1.0 is exact, 0.0 is orthogonal
+            VECTOR_SIMILARITY_THRESHOLD = 0.60
+           
+            for hits in results:
+                if not hits:
+                    continue
+               
+                # hits is a list of matches for ONE segment of the query audio
+                # We usually only care about the very best match for that segment
+                top_hit = hits[0]
+               
+                if top_hit.distance > VECTOR_SIMILARITY_THRESHOLD:
+                    mbid = top_hit.entity.get("mbid")
+                    
+                    if mbid not in song_stats:
+                        song_stats[mbid] = {
+                            "count": 0,
+                            "total_distance": 0.0
+                        }
+                    
+                    song_stats[mbid]["count"] += 1
+                    song_stats[mbid]["total_distance"] += top_hit.distance
+
+            # 6. Format Results
+            ranked_songs = []
+           
+            for mbid, stats in song_stats.items():
+                match_percentage = (stats["count"] / total_segments) * 100
+                avg_distance = stats["total_distance"] / stats["count"]
+                
+                ranked_songs.append({
+                    "mbid": mbid,
+                    "match_percentage": round(match_percentage, 2),
+                    "match_count": stats["count"],
+                    "total_segments": total_segments
+                })
+ 
+            # Sort by match percentage descending
+            ranked_songs.sort(key=lambda x: x["match_percentage"], reverse=True)
+           
+            # 7. Apply Confidence Logic (Exact vs Similar)
+            # This threshold determines if we trust the result enough to call it "Exact"
+            EXACT_MATCH_CONFIDENCE = 40.0  # i.e., 40% of the file matched
+            TOP_K = 5
+           
+            response = {
+                "status": "success",
+                "message": "",
+                "exact_match_song_id": None,
+                "similar_songs_ids": []
+            }
+
+           
+            if ranked_songs:
+                top_song = ranked_songs[0]
+                
+                # Logic: If algorithm is confident (high match %), it's an exact match.
+                is_exact = top_song["match_percentage"] >= EXACT_MATCH_CONFIDENCE
+                
+                if is_exact:
+                    response["exact_match_song_id"] = top_song["mbid"]
+                    response["similar_songs_ids"] = [song["mbid"] for song in ranked_songs[1 : TOP_K + 1]]
+                    response["message"] = f"Exact match found with {top_song['match_percentage']}% confidence"
+                else:
+                    response["exact_match_song_id"] = None
+                    response["similar_songs_ids"] = [song["mbid"] for song in ranked_songs[:TOP_K]]
+                    response["message"] = f"No exact match. Top result has {top_song['match_percentage']}% match"
+            else:
+                response["message"] = "No matches found"
+
+            return response
+
+ 
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Search timeout")
+    except Exception as e:
+        logger.exception(f"Search error: {e}")
+        raise HTTPException(500, "Search failed")
+    finally:
+        await cleaner.cleanup_file(temp_path)
+
+
+@app.post("/fastapi-milvus/batch_ingest_local")
+async def batch_ingest_local(request: LocalIngestRequest, background_tasks: BackgroundTasks):
+    """
+    CRITICAL FIX: Use background task for long-running operation.
+    """
+    ensure_db_connection()
+    if not processor:
+        raise HTTPException(503, "System not ready")
+    
+    folder = Path(request.folder_path)
+    if not folder.exists():
+        raise HTTPException(400, "Folder not found")
+    
+    # Submit to process pool
+    future = process_pool.submit(
+        process_local_batch,
+        str(folder),
+        request.limit,
+        CSV_LOG_FILE,
+        app.state.csv_lock
+    )
+    
+    return {
+        "status": "processing",
+        "message": f"Local batch job started for {folder}",
+        "note": "Check logs for progress"
+    }
+
+
+def process_local_batch(folder_path: str, limit: Optional[int], csv_path: str, csv_lock):
+    """Process local files in worker process with MBID extraction and metadata fetching."""
+    
+    folder = Path(folder_path)
+    files = [f for f in folder.iterdir() if f.suffix.lower() in {'.mp3', '.wav', '.flac', '.m4a'}]
+    
+    if limit:
+        files = files[:limit]
+    
+    # Setup resources
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [LocalWorker-%(process)d] %(message)s')
+    w_logger = logging.getLogger(f"LocalWorker-{os.getpid()}")
+    
+    w_logger.info(f"🚀 Starting local batch job for {len(files)} files")
+    
+    try:
+        connect_milvus()
+        db_col = get_milvus_collection()
+        worker_model = FingerprintGenerator(model_path=MODEL_PATH)
+    except Exception as e:
+        w_logger.exception(f"❌ Worker init failed: {e}")
+        return {"status": "error", "message": str(e)}
+    
+    # Initialize PostgreSQL pool - FIXED VERSION
+    db_available = False
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Initialize the pool
+        loop.run_until_complete(postgres_helper.init_pg_pool())
+        
+        # CRITICAL FIX: Check the pool AFTER initialization
+        db_available = postgres_helper.pg_pool is not None
+        
+        w_logger.info(f"✅ PostgreSQL pool initialized: {db_available}")
+        
+        if db_available:
+            w_logger.info("✅ Database connection is ready for metadata fetching")
+        else:
+            w_logger.warning("⚠️ Database connection failed, will use fallback metadata")
+            
+    except Exception as e:
+        w_logger.exception(f"❌ PostgreSQL pool init failed: {e}")
+        db_available = False
+    
+    success, failed, skipped = 0, 0, 0
+    insert_batch = {"vectors": [], "mbids": [], "offsets": [], "is_mbid_present": []}
+    api_batch = []  # Batch for bulk API
+    
+    for file_path in tqdm(files, desc="Local Batch", ncols=100):
+        raw_song_name = file_path.stem
+        song_name = truncate_song_name(raw_song_name)
+        
+        try:
+            # STEP 1: Extract MBID
+            mbid, mbid_time = extract_mbid(str(file_path))
+            
+            if not mbid:
+                w_logger.warning(f"⚠️ No MBID found for {file_path.name}")
+                track_ingestion_safe(song_name, str(file_path), "Failed: No MBID", csv_lock)
+                failed += 1
+                continue
+            
+            # STEP 1.5: Check if MBID already exists in Milvus
+            try:
+                expr = f'mbid == "{mbid}"'
+                existing_results = db_col.query(expr=expr, output_fields=["mbid"], limit=1)
+                
+                if existing_results:
+                    w_logger.info(f"⏭️ MBID {mbid} already exists, skipping {file_path.name}")
+                    track_ingestion_safe(song_name, str(file_path), f"Skipped: MBID exists", csv_lock)
+                    skipped += 1
+                    continue
+            except Exception as check_error:
+                w_logger.warning(f"⚠️ Could not check MBID uniqueness: {check_error}")
+            
+            # STEP 2: Fetch metadata from PostgreSQL - FIXED VERSION
+            metadata = None
+            if db_available:
+                try:
+                    metadata = loop.run_until_complete(postgres_helper.fetch_song_metadata(mbid))
+                    
+                    if metadata:
+                        w_logger.info(f"✅ Metadata fetched: {metadata['title']} by {metadata['artist']}")
+                    else:
+                        w_logger.warning(f"⚠️ No metadata in DB for MBID {mbid}")
+                        
+                except Exception as meta_error:
+                    w_logger.exception(f"❌ Metadata fetch failed for {mbid}: {meta_error}")
+            else:
+                w_logger.warning(f"⚠️ Database unavailable, skipping metadata fetch for {mbid}")
+            
+            if not metadata:
+                w_logger.warning(f"⚠️ Using fallback metadata for MBID {mbid}")
+                metadata = {
+                    "title": song_name,
+                    "artist": "Unknown Artist",
+                    "album": "Unknown Album",
+                    "genre": None,
+                    "duration": 0
+                }
+            
+            # STEP 3: Generate fingerprints
+            with open(file_path, "rb") as f:
+                fingerprints = worker_model.process_audio(f.read())
+            
+            if not fingerprints:
+                track_ingestion_safe(song_name, str(file_path), "Failed: No fingerprints", csv_lock)
+                failed += 1
+                continue
+            
+            # STEP 4: Add to Milvus batch
+            vectors = [np.array(f["vector"]).tolist() for f in fingerprints]
+            mbids = [mbid] * len(fingerprints)
+            offsets = [float(f["offset"]) for f in fingerprints]
+            is_mbid_present_flags = [True] * len(fingerprints)
+
+            
+            insert_batch["vectors"].extend(vectors)
+            insert_batch["mbids"].extend(mbids)
+            insert_batch["offsets"].extend(offsets)
+            insert_batch["is_mbid_present"].extend(is_mbid_present_flags)
+            
+            # STEP 5: Add to API batch
+            genres = []
+            if metadata.get("genre"):
+                genre_str = str(metadata["genre"])
+                genres = [g.strip() for g in genre_str.split(",") if g.strip()]
+            
+            api_batch.append({
+                "title": metadata["title"],
+                "artist": metadata["artist"],
+                "album": metadata["album"],
+                "duration": metadata["duration"],
+                "milvus_embedding_id": mbid,
+                "genres": genres,
+                "is_mbid_present": True
+            })
+            
+            # Insert batch when it reaches threshold
+            if len(insert_batch["vectors"]) >= BATCH_INSERT_SIZE:
+                try:
+                    db_col.insert([
+                        insert_batch["vectors"],
+                        insert_batch["mbids"],
+                        insert_batch["offsets"],
+                        insert_batch["is_mbid_present"]
+                    ])
+                    db_col.flush()
+                    insert_batch = {"vectors": [], "mbids": [], "offsets": [], "is_mbid_present": []}
+                except Exception as db_err:
+                    w_logger.exception(f"❌ Batch insert failed: {db_err}")
+                    connect_milvus()
+                    db_col = get_milvus_collection()
+            
+            # Send API batch when it reaches threshold
+            if len(api_batch) >= 10:  # Send every 10 songs
+                send_batch_to_bulk_api_sync(api_batch)
+                api_batch = []
+            
+            track_ingestion_safe(song_name, str(file_path), f"Success (mbid={mbid})", csv_lock)
+            success += 1
+            
+        except Exception as e:
+            w_logger.exception(f"❌ Error processing {file_path.name}: {e}")
+            track_ingestion_safe(song_name, str(file_path), f"Error: {e}", csv_lock)
+            failed += 1
+    
+    # Final batch inserts
+    if insert_batch["vectors"]:
+        try:
+            db_col.insert([
+                insert_batch["vectors"],
+                insert_batch["mbids"],
+                insert_batch["offsets"],
+                insert_batch["is_mbid_present"]
+            ])
+            db_col.flush()
+        except Exception as e:
+            w_logger.exception(f"❌ Final batch insert failed: {e}")
+    
+    # Final API batch
+    if api_batch:
+        send_batch_to_bulk_api_sync(api_batch)
+    
+    w_logger.info(f"✅ Local batch complete: {success} success, {failed} failed, {skipped} skipped")
+    
+    # Cleanup
+    try:
+        loop.run_until_complete(postgres_helper.close_pg_pool())
+    except:
+        pass
+    
+    return {
+        "status": "success",
+        "processed": success,
+        "failed": failed,
+        "skipped": skipped
+    }
+
+
+
+@app.post("/fastapi-milvus/batch_ingest_s3")
+async def batch_ingest_s3(request: S3IngestRequest):
+    """
+    CRITICAL FIX: Use process pool instead of manual queue.
+    """
+    s3 = boto3.client('s3',aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'), region_name=os.getenv('AWS_DEFAULT_REGION') )
+    try:
+        s3.head_bucket(Bucket=request.bucket_name)
+    except ClientError:
+        raise HTTPException(400, "Invalid bucket or no permissions")
+    
+    # Submit job to process pool
+    job_data = (request.bucket_name, request.prefix, request.limit)
+    future = process_pool.submit(
+        worker_s3_job,
+        job_data,
+        CSV_LOG_FILE,
+        app.state.csv_lock
+    )
+    
+    return {
+        "status": "queued",
+        "message": f"S3 job queued for {request.bucket_name}/{request.prefix}",
+        "note": "Check logs for progress"
+    }
+
+@app.get("/fastapi-milvus/test_db_connection")
+async def test_db_connection():
+    """Test SSH tunnel and PostgreSQL connection."""
+    
+    success = await test_connection()
+    
+    if success:
+        return {
+            "status": "success",
+            "message": "SSH tunnel and database connection working"
+        }
+    else:
+        raise HTTPException(503, "Database connection failed")
+
+@app.get("/fastapi-milvus/test_metadata/{mbid}")
+async def test_metadata_fetch(mbid: str):
+    """Test metadata fetch for a specific MBID."""
+    
+    if not pg_pool:
+        return {
+            "error": "PostgreSQL pool not initialized",
+            "pool_status": "not_initialized"
+        }
+    
+    try:
+        metadata = await fetch_song_metadata(mbid)
+        
+        if metadata:
+            return {
+                "status": "success",
+                "mbid": mbid,
+                "metadata": metadata,
+                "pool_status": "connected"
+            }
+        else:
+            return {
+                "status": "not_found",
+                "mbid": mbid,
+                "message": "No metadata found in database",
+                "pool_status": "connected"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "mbid": mbid,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+@app.get("/fastapi-milvus/stats")
+async def get_milvus_stats(mbid: Optional[str] = None):
+    """
+    Get Milvus statistics or specific song info by MBID.
+    
+    - No query params: Returns total songs count and vectors
+    - With ?mbid=xxx: Returns specific song details from Milvus only
+    """
+    ensure_db_connection()
+    
+    try:
+        # Case 1: Get specific song by MBID
+        if mbid:
+            expr = f'mbid == "{mbid}"'
+            results = collection.query(
+                expr=expr,
+                output_fields=["mbid", "offsets", "is_mbid_present"],
+                limit=10000
+            )
+            
+            if not results:
+                raise HTTPException(404, f"MBID '{mbid}' not found")
+            
+            offsets = sorted([float(r.get("offsets", 0)) for r in results])
+            
+            return {
+                "mbid": mbid,
+                "vector_count": len(results),
+                "is_mbid_present": results[0].get("is_mbid_present", False),
+                "offsets": {
+                    "min": offsets[0] if offsets else 0,
+                    "max": offsets[-1] if offsets else 0,
+                    "sample": offsets[:10]
+                }
+            }
+        
+        # Case 2: Get overall statistics
+        total_vectors = collection.num_entities
+        
+        # Count unique MBIDs
+        all_mbids = set()
+        offset = 0
+        
+        while True:
+            results = collection.query(
+                expr="mbid != ''",
+                output_fields=["mbid"],
+                limit=1000,
+                offset=offset
+            )
+            
+            if not results:
+                break
+            
+            all_mbids.update(r.get("mbid") for r in results if r.get("mbid"))
+            
+            if len(results) < 1000:
+                break
+            
+            offset += 1000
+        
+        unique_songs = len(all_mbids)
+        
+        return {
+            "total_unique_songs": unique_songs,
+            "total_vectors": total_vectors,
+            "avg_vectors_per_song": round(total_vectors / unique_songs, 2) if unique_songs > 0 else 0
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"❌ Stats error: {e}")
+        raise HTTPException(500, str(e))
+
+@app.post("/fastapi-milvus/upload-songs-to-s3/")
+async def ingest_music(request: BulkRequestUploadS3, background_tasks: BackgroundTasks):
+    """
+    Starts a background job to download 'N' songs, upload to S3, 
+    and log results to the 'wazzdat' schema.
+    """
+    try:
+        # --- 1. ROBUST INPUT VALIDATION ---
+        # Prevent zero or negative counts
+        if request.song_count <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Song count must be greater than 0."
+            )
+
+        # Prevent overly large batches that could choke the server
+        if request.song_count > 10000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Please limit batches to 10000 songs."
+            )
+
+        # Prevent empty or whitespace-only S3 strings
+        if not request.s3_bucket_name.strip() or not request.s3_folder_name.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="S3 bucket and folder names cannot be empty."
+            )
+
+        # --- 2. QUEUE THE JOB ---
+        # We log this action so we have a trace ID or timestamp of WHEN it was requested
+        logger.info(f"Queuing bulk job for {request.song_count} songs to {request.s3_bucket_name}")
+        
+        background_tasks.add_task(upload_bulk_songs_to_s3_job, request)
+        
+        return {
+            "message": "Bulk ingestion started",
+            "target_count": request.song_count,
+            "s3_bucket": request.s3_bucket_name,
+            "s3_folder": request.s3_folder_name,
+            "note": "Check database 'wazzdat.s3_downloads_log' for progress."
+        }
+
+    # Catch validation errors we just raised so they pass through cleanly
+    except HTTPException as he:
+        raise he
+
+    # Catch any unexpected system errors (e.g., BackgroundTasks fails)
+    except Exception as e:
+        logger.error(f"CRITICAL: Failed to queue bulk job: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Failed to initialize background job."
+        )
+
+class ReconcileRequest(BaseModel):
+    s3_bucket_name: str
+    s3_folder_name: str
+
+@app.post("/fastapi-milvus/reconcile-s3-db")
+async def reconcile_data(req: ReconcileRequest):
+    """
+    Scans S3 bucket for songs that are missing in the Database 
+    and restores their entries automatically.
+    """
+    # This might take time, so we await it (or use background tasks if very large)
+    result = await reconcile_s3_db_job(req.s3_bucket_name, req.s3_folder_name)
+    
+    return {
+        "message": "Reconciliation completed",
+        "details": result
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)

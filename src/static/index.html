@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neural Audio Search</title>
+    <style>
+        :root {
+            --bg: #050510;
+            --accent: #4CAF50;
+            --danger: #ff4444;
+            --text-main: #f9fafb;
+            --text-soft: #a9b0c3;
+            --card: rgba(20, 20, 35, 0.85);
+            --border-subtle: rgba(255, 255, 255, 0.06);
+            --radius-card: 18px;
+            --shadow-soft: 0 18px 50px rgba(0, 0, 0, 0.65);
+        }
+ 
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+ 
+        body {
+            min-height: 100vh;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+            background:
+                radial-gradient(circle at top left, #2f3bff11, transparent 55%),
+                radial-gradient(circle at bottom right, #4caf5030, transparent 55%),
+                radial-gradient(circle at top right, #e91e6330, transparent 55%),
+                var(--bg);
+            color: var(--text-main);
+            scroll-behavior: smooth;
+        }
+ 
+        /* Hero Section - Full viewport focus */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 20px;
+            position: relative;
+        }
+ 
+        .hero-content {
+            width: 100%;
+            max-width: 580px;
+            text-align: center;
+        }
+ 
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01));
+            color: var(--text-soft);
+            font-size: 11px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-bottom: 20px;
+        }
+ 
+        .badge-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 30% 30%, #9effb2, #23c45a);
+            box-shadow: 0 0 14px rgba(46, 204, 113, 0.9);
+        }
+ 
+        h1 {
+            font-size: clamp(32px, 5vw, 48px);
+            letter-spacing: 0.02em;
+            margin-bottom: 16px;
+            background: linear-gradient(135deg, #fff, #a9b0c3);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+ 
+        .subtitle {
+            color: var(--text-soft);
+            font-size: 15px;
+            margin-bottom: 40px;
+            line-height: 1.6;
+        }
+ 
+        .hero-card {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
+            border-radius: var(--radius-card);
+            padding: 32px;
+            border: 1px solid var(--border-subtle);
+            box-shadow: var(--shadow-soft);
+            backdrop-filter: blur(22px) saturate(150%);
+            -webkit-backdrop-filter: blur(22px) saturate(150%);
+            position: relative;
+            overflow: hidden;
+        }
+ 
+        .hero-card::before {
+            content: "";
+            position: absolute;
+            inset: -40%;
+            background: radial-gradient(circle at 50% 50%, rgba(76, 175, 80, 0.2), transparent 70%);
+            opacity: 0.5;
+            pointer-events: none;
+        }
+ 
+        .hero-inner {
+            position: relative;
+            z-index: 1;
+        }
+ 
+        button.record {
+            width: 100%;
+            padding: 20px 32px;
+            background: radial-gradient(circle at 0% 0%, rgba(190, 242, 100, 0.6), rgba(34, 197, 94, 0.95));
+            color: #020617;
+            border: none;
+            border-radius: 14px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.16s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            letter-spacing: 0.02em;
+            box-shadow: 0 12px 32px rgba(34, 197, 94, 0.55);
+        }
+ 
+        button.record:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 16px 40px rgba(34, 197, 94, 0.7);
+        }
+ 
+        button.record.recording {
+            background: linear-gradient(135deg, #ef4444, #b91c1c);
+            color: #fee2e2;
+            box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.4), 0 0 30px rgba(248, 113, 113, 0.65);
+            animation: pulse 1.4s infinite;
+        }
+ 
+        .or-separator {
+            text-align: center;
+            color: rgba(148, 163, 184, 0.6);
+            font-size: 11px;
+            margin: 24px 0;
+            text-transform: uppercase;
+            letter-spacing: 0.22em;
+            position: relative;
+        }
+ 
+        .or-separator::before,
+        .or-separator::after {
+            content: "";
+            position: absolute;
+            top: 50%;
+            width: 35%;
+            height: 1px;
+            background: linear-gradient(to right, transparent, rgba(148, 163, 184, 0.4));
+        }
+ 
+        .or-separator::before { left: 0; }
+        .or-separator::after { right: 0; transform: scaleX(-1); }
+ 
+        .file-upload-wrapper {
+            position: relative;
+            margin-bottom: 16px;
+        }
+ 
+        input[type="file"] {
+            width: 100%;
+            padding: 14px;
+            border-radius: 12px;
+            border: 2px dashed rgba(148, 163, 184, 0.4);
+            background: rgba(15, 23, 42, 0.6);
+            color: var(--text-main);
+            font-size: 13px;
+            cursor: pointer;
+            transition: 0.2s ease;
+        }
+ 
+        input[type="file"]:hover {
+            border-color: var(--accent);
+            background: rgba(15, 23, 42, 0.8);
+        }
+ 
+        button.primary {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.05));
+            color: var(--text-main);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.16s ease;
+        }
+ 
+        button.primary:hover {
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.08));
+            transform: translateY(-1px);
+        }
+ 
+        #result {
+            margin-top: 24px;
+            display: none;
+        }
+ 
+        .exact-match-card {
+            padding: 24px;
+            background: linear-gradient(145deg, rgba(76, 175, 80, 0.15), rgba(34, 197, 94, 0.08));
+            border-radius: 14px;
+            border: 1px solid rgba(76, 175, 80, 0.4);
+            margin-bottom: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+ 
+        .exact-match-card::before {
+            content: "✓ EXACT MATCH";
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            font-size: 9px;
+            padding: 4px 10px;
+            background: rgba(34, 197, 94, 0.3);
+            border-radius: 999px;
+            letter-spacing: 0.1em;
+            color: #bbf7d0;
+            border: 1px solid rgba(76, 175, 80, 0.5);
+        }
+ 
+        .match-title {
+            font-size: 24px;
+            font-weight: 700;
+            color: #bbf7d0;
+            margin-bottom: 6px;
+        }
+ 
+        .match-mbid {
+            font-size: 12px;
+            color: #86efac;
+            margin-bottom: 16px;
+            font-family: 'Courier New', monospace;
+            word-break: break-all;
+        }
+ 
+        .match-stats {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+ 
+        .stat {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+ 
+        .stat-label {
+            font-size: 10px;
+            color: rgba(187, 247, 208, 0.7);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+ 
+        .stat-value {
+            font-size: 18px;
+            font-weight: 600;
+            color: #bbf7d0;
+        }
+ 
+        .similar-section {
+            margin-top: 20px;
+        }
+ 
+        .section-title {
+            font-size: 11px;
+            color: var(--text-soft);
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            margin-bottom: 12px;
+        }
+ 
+        .similar-song {
+            padding: 16px;
+            background: rgba(15, 23, 42, 0.6);
+            border-radius: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            margin-bottom: 10px;
+            transition: 0.2s ease;
+        }
+ 
+        .similar-song:hover {
+            background: rgba(15, 23, 42, 0.8);
+            border-color: rgba(148, 163, 184, 0.4);
+        }
+ 
+        .similar-mbid {
+            font-size: 14px;
+            font-weight: 600;
+            color: #a5b4fc;
+            margin-bottom: 8px;
+            font-family: 'Courier New', monospace;
+            word-break: break-all;
+        }
+ 
+        .info-message {
+            font-size: 12px;
+            color: var(--text-soft);
+            font-style: italic;
+        }
+ 
+        .no-match {
+            padding: 20px;
+            text-align: center;
+            color: #fecaca;
+            font-size: 14px;
+            background: rgba(239, 68, 68, 0.1);
+            border-radius: 10px;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+ 
+        .scroll-indicator {
+            position: absolute;
+            bottom: 41px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.15em;
+            animation: bounce 2s infinite;
+        }
+ 
+        @keyframes bounce {
+            0%, 100% { transform: translateX(-50%) translateY(0); }
+            50% { transform: translateX(-50%) translateY(-10px); }
+        }
+ 
+        /* Features Section */
+        .features {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 80px 20px;
+        }
+ 
+        .section-header {
+            text-align: center;
+            margin-bottom: 60px;
+        }
+ 
+        .section-header h2 {
+            font-size: clamp(24px, 3vw, 32px);
+            margin-bottom: 12px;
+        }
+ 
+        .section-header p {
+            color: var(--text-soft);
+            font-size: 14px;
+        }
+ 
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 24px;
+            margin-bottom: 80px;
+        }
+ 
+        .feature-card {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
+            border-radius: var(--radius-card);
+            padding: 28px;
+            border: 1px solid var(--border-subtle);
+            box-shadow: var(--shadow-soft);
+            backdrop-filter: blur(22px) saturate(150%);
+            transition: 0.3s ease;
+        }
+ 
+        .feature-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75);
+        }
+ 
+        .feature-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+ 
+        .feature-icon {
+            font-size: 24px;
+        }
+ 
+        .feature-card h3 {
+            font-size: 18px;
+            margin: 0;
+        }
+ 
+        .feature-desc {
+            color: var(--text-soft);
+            font-size: 13px;
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }
+ 
+        label {
+            display: block;
+            font-size: 11px;
+            color: var(--text-soft);
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            margin-bottom: 8px;
+        }
+ 
+        input[type="text"],
+        input[type="number"] {
+            width: 100%;
+            padding: 12px;
+            border-radius: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.4);
+            background: rgba(15, 23, 42, 0.8);
+            color: var(--text-main);
+            font-size: 13px;
+            margin-bottom: 16px;
+            transition: 0.2s ease;
+        }
+ 
+        input[type="text"]:focus,
+        input[type="number"]:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px rgba(76, 175, 80, 0.2);
+        }
+ 
+        .status {
+            margin-top: 12px;
+            font-size: 12px;
+            min-height: 20px;
+            color: var(--text-soft);
+        }
+ 
+        .success { color: #4ade80; }
+        .error { color: var(--danger); }
+ 
+        .action-btn {
+            width: 100%;
+            padding: 12px;
+            background: radial-gradient(circle at 0% 0%, rgba(190, 242, 100, 0.5), rgba(34, 197, 94, 0.9));
+            color: #020617;
+            border: none;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.16s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+ 
+        .action-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 12px 28px rgba(34, 197, 94, 0.5);
+        }
+ 
+        .danger-btn {
+            background: linear-gradient(135deg, #ef4444, #b91c1c);
+            color: #fff;
+        }
+ 
+        .danger-btn:hover {
+            box-shadow: 0 12px 28px rgba(239, 68, 68, 0.5);
+        }
+ 
+        @keyframes pulse {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.6); }
+            70% { transform: scale(1.015); box-shadow: 0 0 0 10px rgba(248, 113, 113, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); }
+        }
+ 
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+            .hero {
+                min-height: 90vh;
+            }
+        }
+    </style>
+</head>
+<body>
+ 
+<!-- Hero Section - Main Focus -->
+<section class="hero">
+    <div class="hero-content">
+        <h1>Wazzdat Song!!</h1>
+        <p class="subtitle">Record a 5-second snippet or upload a clip to match against your neural fingerprint database</p>
+ 
+        <div class="hero-card">
+            <div class="hero-inner">
+                <button id="recordBtn" class="record" onclick="recordAndSearch()">
+                    <span>🎤 Record 5 seconds & identify</span>
+                </button>
+ 
+                <div class="or-separator">or upload file</div>
+ 
+                <div class="file-upload-wrapper">
+                    <input type="file" id="searchFile" accept="audio/*">
+                </div>
+ 
+                <button class="primary" onclick="searchFromFile()">
+                    Search from file
+                </button>
+ 
+                <div id="result"></div>
+            </div>
+        </div>
+    </div>
+    <div class="scroll-indicator">Scroll for more features ↓</div>
+</section>
+ 
+<!-- Features Section -->
+<section class="features">
+    <div class="section-header">
+        <h2>Management & Tools</h2>
+        <p>Bulk ingest, system administration, and advanced features</p>
+    </div>
+ 
+    <div class="grid">
+        <!-- Bulk Ingest Local -->
+        <div class="feature-card">
+            <div class="feature-header">
+                <span class="feature-icon">📂</span>
+                <h3>Local Batch Ingest</h3>
+            </div>
+            <p class="feature-desc">Scan a server folder and add audio files to the neural index in bulk</p>
+ 
+            <label for="localPath">Server folder path</label>
+            <input type="text" id="localPath" placeholder="/home/user/music">
+ 
+            <label for="localLimit">Track limit</label>
+            <input type="number" id="localLimit" value="50" min="1">
+ 
+            <button class="action-btn" onclick="batchIngestLocal()">
+                Start local ingest
+            </button>
+            <div id="localStatus" class="status"></div>
+        </div>
+ 
+        <!-- S3 Ingest -->
+        <div class="feature-card">
+            <div class="feature-header">
+                <span class="feature-icon">☁️</span>
+                <h3>S3 Cloud Ingest</h3>
+            </div>
+            <p class="feature-desc">Import audio files directly from your AWS S3 bucket</p>
+ 
+            <label for="bucketName">S3 bucket name</label>
+            <input type="text" id="bucketName" placeholder="my-audio-bucket">
+ 
+            <label for="s3Prefix">Prefix (optional)</label>
+            <input type="text" id="s3Prefix" placeholder="music/collection/">
+ 
+            <label for="s3Limit">Track limit</label>
+            <input type="number" id="s3Limit" value="50" min="1">
+ 
+            <button class="action-btn" onclick="batchIngestS3()">
+                Start S3 ingest
+            </button>
+            <div id="s3Status" class="status"></div>
+        </div>
+ 
+        <!-- Single Upload -->
+        <div class="feature-card">
+            <div class="feature-header">
+                <span class="feature-icon">⬆️</span>
+                <h3>Single Track Upload</h3>
+            </div>
+            <p class="feature-desc">Add individual songs to the database with custom metadata</p>
+ 
+            <label for="songName">Song name</label>
+            <input type="text" id="songName" placeholder="Artist - Title">
+ 
+            <label for="uploadFile">Audio file</label>
+            <input type="file" id="uploadFile" accept="audio/*" style="margin-bottom: 16px;">
+ 
+            <button class="action-btn" onclick="uploadSong()">
+                Upload track
+            </button>
+            <div id="uploadStatus" class="status"></div>
+        </div>
+ 
+        <!-- System Tools -->
+        <div class="feature-card">
+            <div class="feature-header">
+                <span class="feature-icon">⚙️</span>
+                <h3>System Administration</h3>
+            </div>
+            <p class="feature-desc">Monitor health, download logs, and manage the database</p>
+ 
+            <button class="action-btn" onclick="checkHealth()">
+                Check system health
+            </button>
+            <div id="healthStatus" class="status"></div>
+ 
+            <button class="action-btn" onclick="downloadLogs()" style="margin-top: 12px;">
+                Download CSV logs
+            </button>
+ 
+            <button class="action-btn danger-btn" onclick="resetDatabase()" style="margin-top: 12px;">
+                Reset database
+            </button>
+        </div>
+    </div>
+</section>
+ 
+<script>
+    const API_URL = "/fastapi-milvus";
+ 
+    // --- SEARCH FUNCTIONS ---
+    async function recordAndSearch() {
+        const btn = document.getElementById('recordBtn');
+        const resultDiv = document.getElementById('result');
+ 
+        if (!navigator.mediaDevices) return alert("Microphone not supported in this browser.");
+ 
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const mediaRecorder = new MediaRecorder(stream);
+            const chunks = [];
+ 
+            mediaRecorder.ondataavailable = e => chunks.push(e.data);
+ 
+            mediaRecorder.onstop = async () => {
+                const blob = new Blob(chunks, { type: 'audio/webm' });
+                const file = new File([blob], "recording.webm", { type: "audio/webm" });
+ 
+                btn.innerHTML = "<span>🎤 Record 5 seconds & identify</span>";
+                btn.className = "record";
+ 
+                performSearch(file);
+            };
+ 
+            mediaRecorder.start();
+            btn.className = "record recording";
+            let timeLeft = 5;
+            btn.innerHTML = `<span>🔴 Recording... ${timeLeft}s</span>`;
+ 
+            const timer = setInterval(() => {
+                timeLeft--;
+                btn.innerHTML = `<span>🔴 Recording... ${timeLeft}s</span>`;
+                if (timeLeft <= 0) clearInterval(timer);
+            }, 1000);
+ 
+            setTimeout(() => {
+                mediaRecorder.stop();
+                stream.getTracks().forEach(track => track.stop());
+            }, 5000);
+ 
+        } catch (err) {
+            alert("Could not access microphone: " + err);
+        }
+    }
+ 
+    async function searchFromFile() {
+        const file = document.getElementById('searchFile').files[0];
+        if (!file) return alert("Select a file first");
+        performSearch(file);
+    }
+ 
+    async function performSearch(file) {
+        const resultDiv = document.getElementById('result');
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = "⏳ Analyzing audio...";
+ 
+        const formData = new FormData();
+        formData.append("audio", file);
+ 
+        try {
+            const res = await fetch(`${API_URL}/search`, { method: 'POST', body: formData });
+            const data = await res.json();
+ 
+            // Handle new response format with exact_match_song_id and similar_songs_ids
+            if (data.exact_match_song_id) {
+                // Exact match found - display it prominently
+                let html = `
+                    <div class="exact-match-card">
+                        <div class="match-title">Exact Match Found!</div>
+                        <div class="match-mbid">MBID: ${data.exact_match_song_id}</div>
+                        <div class="info-message">${data.message}</div>
+                    </div>
+                `;
+ 
+                // Show similar songs if available
+                if (data.similar_songs_ids && data.similar_songs_ids.length > 0) {
+                    html += '<div class="similar-section"><div class="section-title">Other possible matches</div>';
+                    data.similar_songs_ids.forEach((mbid, index) => {
+                        html += `
+                            <div class="similar-song">
+                                <div class="similar-mbid">MBID: ${mbid}</div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                }
+ 
+                resultDiv.innerHTML = html;
+ 
+            } else if (data.similar_songs_ids && data.similar_songs_ids.length > 0) {
+                // No exact match, but similar songs found
+                let html = `<div class="similar-section">
+                    <div class="section-title">Possible matches (no exact match)</div>
+                    <div class="info-message" style="margin-bottom: 16px;">${data.message}</div>`;
+                
+                data.similar_songs_ids.forEach((mbid, index) => {
+                    html += `
+                        <div class="similar-song">
+                            <div class="similar-mbid">MBID: ${mbid}</div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+                resultDiv.innerHTML = html;
+ 
+            } else {
+                // No matches found at all
+                resultDiv.innerHTML = `<div class="no-match">❌ ${data.message || 'No matching songs found in the database'}</div>`;
+            }
+ 
+        } catch (e) {
+            resultDiv.innerHTML = '<div class="no-match">❌ Error during search</div>';
+            console.error('Search error:', e);
+        }
+    }
+ 
+    // --- BATCH INGEST LOCAL ---
+    async function batchIngestLocal() {
+        const path = document.getElementById('localPath').value;
+        const limit = document.getElementById('localLimit').value;
+        const status = document.getElementById('localStatus');
+ 
+        if (!path) return alert("Enter a folder path");
+ 
+        status.innerHTML = "⏳ Processing... check terminal for progress";
+        status.className = "status";
+ 
+        try {
+            const res = await fetch(`${API_URL}/batch_ingest_local`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ folder_path: path, limit: parseInt(limit) })
+            });
+            const data = await res.json();
+ 
+            if (res.ok) {
+                status.innerHTML = `✅ Success: ${data.processed}, Skipped: ${data.skipped}, Failed: ${data.failed}`;
+                status.className = "status success";
+            } else {
+                status.innerHTML = `❌ ${data.detail}`;
+                status.className = "status error";
+            }
+        } catch (e) {
+            status.innerHTML = "❌ Network error";
+            status.className = "status error";
+        }
+    }
+ 
+    // --- BATCH INGEST S3 ---
+    async function batchIngestS3() {
+        const bucket = document.getElementById('bucketName').value;
+        const prefix = document.getElementById('s3Prefix').value;
+        const limit = document.getElementById('s3Limit').value;
+        const status = document.getElementById('s3Status');
+ 
+        if (!bucket) return alert("Enter bucket name");
+ 
+        status.innerHTML = "⏳ Starting background job... check terminal";
+        status.className = "status";
+ 
+        try {
+            const res = await fetch(`${API_URL}/batch_ingest_s3`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    bucket_name: bucket,
+                    prefix: prefix,
+                    limit: parseInt(limit)
+                })
+            });
+            const data = await res.json();
+ 
+            if (res.ok) {
+                status.innerHTML = `✅ ${data.message}`;
+                status.className = "status success";
+            } else {
+                status.innerHTML = `❌ ${data.detail}`;
+                status.className = "status error";
+            }
+        } catch (e) {
+            status.innerHTML = "❌ Network error";
+            status.className = "status error";
+        }
+    }
+ 
+    // --- SINGLE UPLOAD ---
+    async function uploadSong() {
+        const name = document.getElementById('songName').value;
+        const file = document.getElementById('uploadFile').files[0];
+        const status = document.getElementById('uploadStatus');
+ 
+        if (!name || !file) return alert("Enter song name and select file");
+ 
+        status.innerHTML = "⏳ Uploading...";
+        status.className = "status";
+ 
+        const formData = new FormData();
+        formData.append("audio", file);
+ 
+        try {
+            const res = await fetch(`${API_URL}/upload?song_name=${encodeURIComponent(name)}`, {
+                method: 'POST',
+                body: formData
+            });
+            const data = await res.json();
+ 
+            if (res.ok) {
+                status.innerHTML = `✅ Success! ${data.vectors} vectors added`;
+                status.className = "status success";
+                document.getElementById('songName').value = '';
+                document.getElementById('uploadFile').value = '';
+            } else {
+                status.innerHTML = `❌ ${data.detail}`;
+                status.className = "status error";
+            }
+        } catch (e) {
+            status.innerHTML = "❌ Network error";
+            status.className = "status error";
+        }
+    }
+ 
+    // --- SYSTEM TOOLS ---
+    async function checkHealth() {
+        const status = document.getElementById('healthStatus');
+        status.innerHTML = "⏳ Checking...";
+        status.className = "status";
+ 
+        try {
+            const res = await fetch(`${API_URL}/health`);
+            const data = await res.json();
+            status.innerHTML = `✅ ${data.status} | ${data.entities} rows | ${data.temp_files_tracked} temp files`;
+            status.className = "status success";
+        } catch (e) {
+            status.innerHTML = "❌ System offline";
+            status.className = "status error";
+        }
+    }
+ 
+    async function downloadLogs() {
+        window.open(`${API_URL}/download_logs`, '_blank');
+    }
+ 
+    async function resetDatabase() {
+        if (!confirm("⚠️ This will delete ALL data. Continue?")) return;
+ 
+        try {
+            const res = await fetch(`${API_URL}/reset_db`, { method: 'DELETE' });
+            const data = await res.json();
+            alert(data.message);
+        } catch (e) {
+            alert("Error resetting database");
+        }
+    }
+</script>
+</body>
+</html>

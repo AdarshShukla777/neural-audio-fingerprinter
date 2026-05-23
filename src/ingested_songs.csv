@@ -1,0 +1,38 @@
+timestamp,batch_type,source,filename,mbid,status,fingerprint_count,processing_time_sec,error_message
+2026-02-10 19:06:30,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,"10,000 Hours (with Justin Bieber).mp3","10,000_Hours_(with_Justin_Bieber)_01dcc10",success,307,10.524,
+2026-02-10 19:06:36,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,4 Minutes (feat. Justin Timberlake & Timbaland).mp3,4_Minutes_(feat._Justin_Timberlake_&_Timbaland)_b758eef,success,347,6.172,
+2026-02-10 19:06:44,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,92 Explorer.mp3,92_Explorer_c5a19c4,success,387,7.16,
+2026-02-10 19:06:51,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,9XM Smashup # 22 (By DJ Shilpi Sharma).mp3,9XM_Smashup_#_22_(By_DJ_Shilpi_Sharma)_603e856,success,407,7.839,
+2026-02-10 19:06:59,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,A Thousand Bad Times.mp3,A_Thousand_Bad_Times_dd31cdf,success,405,7.397,
+2026-02-10 19:07:09,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aa Bhi Jaa Sanam.mp3,Aa_Bhi_Jaa_Sanam_f489f32,success,353,6.709,
+2026-02-10 19:07:20,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aadat.mp3,Aadat_5968e9c,success,612,11.08,
+2026-02-10 19:07:21,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Koi Baat Ho Gayi.mp3,Aaj_Koi_Baat_Ho_Gayi_df58ce4,failed,0,0.462,No fingerprints generated
+2026-02-10 19:07:28,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Sajeya.mp3,Aaj_Sajeya_f3acd58,success,420,7.67,
+2026-02-10 19:07:48,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Sik Mitran Di.mp3,Aaj_Sik_Mitran_Di_2744240,success,1099,19.999,
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,"10,000 Hours (with Justin Bieber).mp3","10,000_Hours_(with_Justin_Bieber)_01dcc10",skipped,0,0.017,Already exists in database
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,4 Minutes (feat. Justin Timberlake & Timbaland).mp3,4_Minutes_(feat._Justin_Timberlake_&_Timbaland)_b758eef,skipped,0,0.007,Already exists in database
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,92 Explorer.mp3,92_Explorer_c5a19c4,skipped,0,0.005,Already exists in database
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,9XM Smashup # 22 (By DJ Shilpi Sharma).mp3,9XM_Smashup_#_22_(By_DJ_Shilpi_Sharma)_603e856,skipped,0,0.006,Already exists in database
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,A Thousand Bad Times.mp3,A_Thousand_Bad_Times_dd31cdf,skipped,0,0.006,Already exists in database
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aa Bhi Jaa Sanam.mp3,Aa_Bhi_Jaa_Sanam_f489f32,skipped,0,0.004,Already exists in database
+2026-02-10 19:11:06,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aadat.mp3,Aadat_5968e9c,skipped,0,0.004,Already exists in database
+2026-02-10 19:11:07,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Koi Baat Ho Gayi.mp3,Aaj_Koi_Baat_Ho_Gayi_df58ce4,failed,0,0.174,No fingerprints generated
+2026-02-10 19:11:07,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Sajeya.mp3,Aaj_Sajeya_f3acd58,skipped,0,0.004,Already exists in database
+2026-02-10 19:11:07,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Sik Mitran Di.mp3,Aaj_Sik_Mitran_Di_2744240,skipped,0,0.004,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,"10,000 Hours (with Justin Bieber).mp3","10,000_Hours_(with_Justin_Bieber)_01dcc10",skipped,0,0.01,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,4 Minutes (feat. Justin Timberlake & Timbaland).mp3,4_Minutes_(feat._Justin_Timberlake_&_Timbaland)_b758eef,skipped,0,0.005,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,92 Explorer.mp3,92_Explorer_c5a19c4,skipped,0,0.005,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,9XM Smashup # 22 (By DJ Shilpi Sharma).mp3,9XM_Smashup_#_22_(By_DJ_Shilpi_Sharma)_603e856,skipped,0,0.006,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,A Thousand Bad Times.mp3,A_Thousand_Bad_Times_dd31cdf,skipped,0,0.006,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aa Bhi Jaa Sanam.mp3,Aa_Bhi_Jaa_Sanam_f489f32,skipped,0,0.004,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aadat.mp3,Aadat_5968e9c,skipped,0,0.003,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Koi Baat Ho Gayi.mp3,Aaj_Koi_Baat_Ho_Gayi_df58ce4,failed,0,0.179,No fingerprints generated
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Sajeya.mp3,Aaj_Sajeya_f3acd58,skipped,0,0.005,Already exists in database
+2026-02-10 19:11:11,local_batch,D:\Adarsh Shukla latest\python 3.13\MusiCNN\musicapp\500_songs\train,Aaj Sik Mitran Di.mp3,Aaj_Sik_Mitran_Di_2744240,skipped,0,0.005,Already exists in database
+2026-02-10 19:51:42,local_batch,AANKH_024b5ec
+2026-02-10 19:51:50,local_batch,Aankhon_Aankhon_50a5750
+2026-02-10 19:52:00,local_batch,Aas_Paas_Khuda_c77f296
+2026-02-10 19:52:06,local_batch,Acróstico_-_Milan_+_Sasha_06defac
+2026-02-10 19:52:11,local_batch,Addicted_to_You_5f5406a
+2026-02-10 19:52:21,local_batch,Ain’t_How_It_Ends_ec6f200
+2026-02-10 19:52:32,local_batch,Ajj_Din_Chadheya_04ee8d6

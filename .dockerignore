@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Git
+.git/
+.gitignore
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files
+.env
+*.env
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker local volumes / databases
+volumes/
+milvus_data/
+
+# OS / editor trash
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Tests cache
+.pytest_cache/
+coverage/
